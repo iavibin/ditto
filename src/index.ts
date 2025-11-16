@@ -22,7 +22,7 @@ const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent // privileged — enable in Dev Portal
+    GatewayIntentBits.MessageContent // privileged — enable in Dev Portal if you need message text
   ],
   partials: [Partials.Message, Partials.Channel, Partials.Reaction]
 });
@@ -46,20 +46,40 @@ function isImageAttachment(att: { contentType?: string | null; name?: string | n
   return /\.(jpe?g|png|gif|webp|bmp|svg)$/i.test(name) || /\.(jpe?g|png|gif|webp|bmp|svg)$/i.test(url);
 }
 
+function safeAuthorTag(m: Message) {
+  // message.author may be undefined on partials; try member.user fallback; finally unknown placeholder
+  const author = (m.author ?? (m.member?.user as any)) as { tag?: string; username?: string } | undefined;
+  if (author?.tag) return author.tag;
+  if (author?.username) return `${author.username}#0000`;
+  return 'Unknown#0000';
+}
+
+function safeChannelRef(m: Message) {
+  return m.channelId ?? 'unknown-channel';
+}
+
 client.on('messageCreate', async (message) => {
   try {
-    if (message.author.bot) return;       // avoid loops
+    if (message.author?.bot) return; // avoid loops
     if (!isSourceChannel(message.channelId)) return;
 
     // image attachments (filter by contentType or filename/url)
     const imageAttachments = message.attachments.filter(att => isImageAttachment(att));
 
-    // embed / thumbnail images
+    // embed / thumbnail images (type-safe)
     const embedImageUrls: string[] = [];
     for (const e of message.embeds) {
-      if (e.image?.url) embedImageUrls.push(e.image.url);
-      else if (e.thumbnail?.url) embedImageUrls.push(e.thumbnail.url);
-      else if (e.type === 'image' && e.url) embedImageUrls.push(e.url);
+      if (e.image?.url) {
+        embedImageUrls.push(e.image.url);
+        continue;
+      }
+      if (e.thumbnail?.url) {
+        embedImageUrls.push(e.thumbnail.url);
+        continue;
+      }
+      // some embeds place an image at embed.url — include if present
+      const maybeUrl = (e as any).url;
+      if (typeof maybeUrl === 'string' && maybeUrl) embedImageUrls.push(maybeUrl);
     }
 
     // nothing image-like? skip
@@ -69,10 +89,11 @@ client.on('messageCreate', async (message) => {
     if (!target || !target.isTextBased()) return;
     const targetChannel = target as TextChannel;
 
-    const header = `**${message.author.tag}** from <#${message.channelId}>`;
+    const header = `**${safeAuthorTag(message)}** from <#${safeChannelRef(message)}>`;
 
     const files: AttachmentBuilder[] = [];
     for (const att of imageAttachments.values()) {
+      // reattach by URL (works in most cases)
       files.push(new AttachmentBuilder(att.url).setName(att.name ?? 'image'));
     }
     for (const url of embedImageUrls) {
@@ -95,17 +116,26 @@ client.on('messageCreate', async (message) => {
 client.on('messageUpdate', async (_, newMessage) => {
   try {
     if (newMessage.partial) await newMessage.fetch().catch(() => {});
-    if (!isSourceChannel(newMessage.channelId)) return;
+    // newMessage might now be a Message after fetch
+    const msg = newMessage as Message;
+    if (!isSourceChannel(msg.channelId)) return;
 
-    const imageAttachments = newMessage.attachments.filter(att => isImageAttachment(att));
+    const imageAttachments = msg.attachments.filter(att => isImageAttachment(att));
     const embedImageUrls: string[] = [];
-    for (const e of newMessage.embeds) {
-      if (e.image?.url) embedImageUrls.push(e.image.url);
-      else if (e.thumbnail?.url) embedImageUrls.push(e.thumbnail.url);
-      else if (e.type === 'image' && e.url) embedImageUrls.push(e.url);
+    for (const e of msg.embeds) {
+      if (e.image?.url) {
+        embedImageUrls.push(e.image.url);
+        continue;
+      }
+      if (e.thumbnail?.url) {
+        embedImageUrls.push(e.thumbnail.url);
+        continue;
+      }
+      const maybeUrl = (e as any).url;
+      if (typeof maybeUrl === 'string' && maybeUrl) embedImageUrls.push(maybeUrl);
     }
 
-    const forwardedId = forwardMap.get(newMessage.id);
+    const forwardedId = forwardMap.get(msg.id);
 
     // if message no longer has images, delete forwarded copy (if exists)
     if (imageAttachments.size === 0 && embedImageUrls.length === 0) {
@@ -113,17 +143,19 @@ client.on('messageUpdate', async (_, newMessage) => {
         const targetCh = (await client.channels.fetch(TARGET_CHANNEL_ID)) as TextChannel;
         const forwarded = await targetCh.messages.fetch(forwardedId).catch(() => null);
         if (forwarded) await forwarded.delete().catch(() => {});
-        forwardMap.delete(newMessage.id);
+        forwardMap.delete(msg.id);
       }
       return;
     }
 
-    // if forwarded exists, update header only (attachments can't be easily edited)
+    // if forwarded exists, update header only (attachments can't be edited easily)
     if (forwardedId) {
       const targetCh = (await client.channels.fetch(TARGET_CHANNEL_ID)) as TextChannel;
       const forwarded = await targetCh.messages.fetch(forwardedId).catch(() => null);
       if (forwarded) {
-        const header = `**${newMessage.author.tag}** from <#${newMessage.channelId}> (edited)`;
+        const authorTag = safeAuthorTag(msg);
+        const channelRef = safeChannelRef(msg);
+        const header = `**${authorTag}** from <#${channelRef}> (edited)`;
         await forwarded.edit({ content: header }).catch(() => {});
       }
       return;
@@ -134,7 +166,10 @@ client.on('messageUpdate', async (_, newMessage) => {
     if (!target || !target.isTextBased()) return;
     const targetChannel = target as TextChannel;
 
-    const header = `**${newMessage.author.tag}** from <#${newMessage.channelId}> (edited)`;
+    const authorTag = safeAuthorTag(msg);
+    const channelRef = safeChannelRef(msg);
+    const header = `**${authorTag}** from <#${channelRef}> (edited)`;
+
     const files: AttachmentBuilder[] = [];
     for (const att of imageAttachments.values()) {
       files.push(new AttachmentBuilder(att.url).setName(att.name ?? 'image'));
@@ -149,7 +184,7 @@ client.on('messageUpdate', async (_, newMessage) => {
       files,
       allowedMentions: { parse: [] }
     });
-    forwardMap.set(newMessage.id, sent.id);
+    forwardMap.set(msg.id, sent.id);
   } catch (err) {
     console.error('messageUpdate error', err);
   }
