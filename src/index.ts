@@ -208,3 +208,14 @@ process.on('unhandledRejection', (err) => {
 });
 
 client.login(token);
+
+// --- Tiny HTTP server so Render sees an open port (for Web Service) ---
+import http from 'node:http';
+
+const PORT = Number(process.env.PORT || 3000);
+http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('OK');
+}).listen(PORT, () => {
+  console.log(`[Health] Listening on port ${PORT}`);
+});
