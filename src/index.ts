@@ -50,7 +50,7 @@ function isImageAttachment(att: { contentType?: string | null; name?: string | n
   if (ct) return ct.startsWith('image');
   const name = att.name ?? '';
   const url = att.url ?? '';
-  return /\.(jpe?g|png|gif|webp|bmp|svg|avif)$/i.test(name) || /\.(jpe?g|png|gif|webp|bmp|svg|avif)$/i.test(url);
+  return /\.(jpe?g|png|gif|webp|bmp|svg|avif)(?:\?.*)?$/i.test(name) || /\.(jpe?g|png|gif|webp|bmp|svg|avif)(?:\?.*)?$/i.test(url);
 }
 
 function safeAuthorTag(m: Message) {
@@ -119,7 +119,41 @@ async function makeFilesFromUrls(urls: string[], fallbackNames: (string | undefi
 }
 
 /* -----------------------
-   messageCreate — download & re-upload
+   New helper: fetch attachments if an embed links to a Discord message
+   ----------------------- */
+
+async function fetchAttachmentsFromEmbedMessageLink(embed: any): Promise<{ url: string; name?: string }[]> {
+  try {
+    if (!embed?.url || typeof embed.url !== 'string') return [];
+    const m = embed.url.match(/discord(?:app)?\.com\/channels\/(\d+)\/(\d+)\/(\d+)/i);
+    if (!m) return [];
+    const [, guildId, channelId, messageId] = m;
+    const ch = await client.channels.fetch(channelId).catch(() => null);
+    if (!ch || !ch.isTextBased()) return [];
+    const msg = await (ch as TextChannel).messages.fetch(messageId).catch(() => null);
+    if (!msg) return [];
+    const results: { url: string; name?: string }[] = [];
+
+    for (const a of msg.attachments.values()) {
+      if (isImageAttachment(a)) results.push({ url: a.url, name: a.name ?? undefined });
+    }
+    for (const e of msg.embeds) {
+      if (e.image?.url) results.push({ url: e.image.url });
+      else if (e.thumbnail?.url) results.push({ url: e.thumbnail.url });
+      else {
+        const maybe = (e as any).url;
+        if (typeof maybe === 'string' && maybe) results.push({ url: maybe });
+      }
+    }
+    return results;
+  } catch (err) {
+    console.warn('fetchAttachmentsFromEmbedMessageLink error', err);
+    return [];
+  }
+}
+
+/* -----------------------
+   messageCreate — download & re-upload (with embed message-link handling)
    ----------------------- */
 
 client.on('messageCreate', async (message) => {
@@ -129,12 +163,33 @@ client.on('messageCreate', async (message) => {
 
     const imageAttachments = message.attachments.filter(att => isImageAttachment(att));
 
+    // collect embed-derived URLs and names; handle message-link embeds specially
     const embedImageUrls: string[] = [];
+    const embedFallbackNames: (string | undefined)[] = [];
     for (const e of message.embeds) {
-      if (e.image?.url) { embedImageUrls.push(e.image.url); continue; }
-      if (e.thumbnail?.url) { embedImageUrls.push(e.thumbnail.url); continue; }
-      const maybe = (e as any).url;
-      if (typeof maybe === 'string' && maybe) embedImageUrls.push(maybe);
+      if (e.image?.url) { embedImageUrls.push(e.image.url); embedFallbackNames.push(undefined); continue; }
+      if (e.thumbnail?.url) { embedImageUrls.push(e.thumbnail.url); embedFallbackNames.push(undefined); continue; }
+      const maybeUrl = (e as any).url;
+      if (typeof maybeUrl === 'string' && maybeUrl) {
+        // direct image link?
+        if (/\.(jpe?g|png|gif|webp|bmp|svg|avif)(?:\?.*)?$/i.test(maybeUrl)) {
+          embedImageUrls.push(maybeUrl);
+          embedFallbackNames.push(undefined);
+          continue;
+        }
+        // try message-link fetching
+        const fromLink = await fetchAttachmentsFromEmbedMessageLink(e);
+        if (fromLink.length > 0) {
+          for (const it of fromLink) {
+            embedImageUrls.push(it.url);
+            embedFallbackNames.push(it.name ?? undefined);
+          }
+          continue;
+        }
+        // fallback: include the URL as-is
+        embedImageUrls.push(maybeUrl);
+        embedFallbackNames.push(undefined);
+      }
     }
 
     if (imageAttachments.size === 0 && embedImageUrls.length === 0) return;
@@ -149,10 +204,13 @@ client.on('messageCreate', async (message) => {
       urls.push(att.url);
       names.push(att.name ?? undefined);
     }
-    for (const url of embedImageUrls) {
-      urls.push(url);
-      names.push(undefined);
+    for (let i = 0; i < embedImageUrls.length; i++) {
+      urls.push(embedImageUrls[i]);
+      names.push(embedFallbackNames[i]);
     }
+
+    // debug: see what we found (remove after testing)
+    console.log('[DEBUG] collected image urls (messageCreate):', urls);
 
     const files = await makeFilesFromUrls(urls, names);
 
@@ -172,8 +230,7 @@ client.on('messageCreate', async (message) => {
 });
 
 /* -----------------------
-   messageUpdate — if images removed: delete forwarded;
-                   if forwarded exists, delete & reupload when attachments changed
+   messageUpdate — same logic as create (fetch original if embed is a message link)
    ----------------------- */
 
 client.on('messageUpdate', async (_, newMessage) => {
@@ -183,12 +240,30 @@ client.on('messageUpdate', async (_, newMessage) => {
     if (!isSourceChannel(msg.channelId)) return;
 
     const imageAttachments = msg.attachments.filter(att => isImageAttachment(att));
+
     const embedImageUrls: string[] = [];
+    const embedFallbackNames: (string | undefined)[] = [];
     for (const e of msg.embeds) {
-      if (e.image?.url) { embedImageUrls.push(e.image.url); continue; }
-      if (e.thumbnail?.url) { embedImageUrls.push(e.thumbnail.url); continue; }
-      const maybe = (e as any).url;
-      if (typeof maybe === 'string' && maybe) embedImageUrls.push(maybe);
+      if (e.image?.url) { embedImageUrls.push(e.image.url); embedFallbackNames.push(undefined); continue; }
+      if (e.thumbnail?.url) { embedImageUrls.push(e.thumbnail.url); embedFallbackNames.push(undefined); continue; }
+      const maybeUrl = (e as any).url;
+      if (typeof maybeUrl === 'string' && maybeUrl) {
+        if (/\.(jpe?g|png|gif|webp|bmp|svg|avif)(?:\?.*)?$/i.test(maybeUrl)) {
+          embedImageUrls.push(maybeUrl);
+          embedFallbackNames.push(undefined);
+          continue;
+        }
+        const fromLink = await fetchAttachmentsFromEmbedMessageLink(e);
+        if (fromLink.length > 0) {
+          for (const it of fromLink) {
+            embedImageUrls.push(it.url);
+            embedFallbackNames.push(it.name ?? undefined);
+          }
+          continue;
+        }
+        embedImageUrls.push(maybeUrl);
+        embedFallbackNames.push(undefined);
+      }
     }
 
     const forwardedId = forwardMap.get(msg.id);
@@ -211,10 +286,13 @@ client.on('messageUpdate', async (_, newMessage) => {
       urls.push(att.url);
       names.push(att.name ?? undefined);
     }
-    for (const url of embedImageUrls) {
-      urls.push(url);
-      names.push(undefined);
+    for (let i = 0; i < embedImageUrls.length; i++) {
+      urls.push(embedImageUrls[i]);
+      names.push(embedFallbackNames[i]);
     }
+
+    // debug:
+    console.log('[DEBUG] collected image urls (messageUpdate):', urls);
 
     const files = await makeFilesFromUrls(urls, names);
     const targetCh = (await client.channels.fetch(TARGET_CHANNEL_ID)) as TextChannel;
