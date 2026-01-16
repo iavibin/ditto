@@ -31,4 +31,5 @@ export async function handleMessageCreate(message: Message, sourceChannels: stri
     } catch (err) {
         console.error('Error in messageCreate handler:', err);
     }
+
 }

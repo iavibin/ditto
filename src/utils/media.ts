@@ -72,8 +72,7 @@ export function safeAuthorTag(m: Message): string {
 }
 
 /**
- * Safely returns the channel reference.
- */
+ * Safely returns the channel reference.*/
 export function safeChannelRef(m: Message): string {
     return m.channelId ?? 'unknown-channel';
 }

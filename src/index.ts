@@ -57,4 +57,5 @@ http.createServer((req, res) => {
   res.end('OK');
 }).listen(PORT, () => {
   console.log(`[Health] Listening on port ${PORT}`);
-});
+}
+);
